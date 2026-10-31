@@ -8,12 +8,17 @@
  * Zero dependencies. Requires Node.js 16+.
  *
  * Usage:
- *   node scanner.js [directory] [--json] [--strict] [--no-color]
+ *   node scanner.js [directory] [--json] [--strict] [--all] [--no-color]
+ *                   [--webhook <url>] [--trust-file <path>] [--no-trust]
  *
- *   directory   Folder to scan. Default: ./resources
- *   --json      Machine-readable output (for CI). Implies --no-color.
- *   --strict    Exit non-zero on medium findings too (default: only high).
- *   --no-color  Disable ANSI colours.
+ *   directory        Folder to scan. Default: ./resources
+ *   --json           Machine-readable output (for CI). Implies --no-color.
+ *   --strict         Exit non-zero on medium findings too (default: only high).
+ *   --all            Show every hit (default: 3 per rule per file, rest summarised).
+ *   --no-color       Disable ANSI colours.
+ *   --webhook <url>  Post the report to a Discord webhook (or SOURCELOCK_WEBHOOK_URL).
+ *   --trust-file <f> Trust list to read (or SOURCELOCK_TRUST_FILE).
+ *   --no-trust       Ignore the trust list entirely.
  *
  * Exit codes: 0 = clean, 1 = findings that match the selected policy,
  *             2 = scanner error (bad target, unreadable root, ...).
@@ -26,6 +31,9 @@
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 
+const { fingerprintFinding, isTrusted, loadTrust } = require('./lib/trust');
+const { postScanReport } = require('./lib/discord-report');
+
 /* ==========================================================================
  * CONFIG — edit this block
  * ========================================================================== */
@@ -34,10 +42,18 @@ const CONFIG = {
   /** Folder scanned when no directory argument is passed. */
   targetDir: './resources',
 
-  /** Extensions that get scanned. Compared case-insensitively. */
-  extensions: ['.lua', '.js', '.html'],
+  /**
+   * Extensions that get scanned. Compared case-insensitively.
+   * `.luac` is included on purpose: compiled Lua cannot be reviewed by a
+   * human, so it has to be reported rather than ignored.
+   */
+  extensions: ['.lua', '.js', '.html', '.luac'],
 
-  /** Files larger than this are skipped (protects against minified vendor blobs). */
+  /**
+   * Files larger than this are not pattern-scanned, but they are still
+   * REPORTED (SL016) rather than skipped silently — otherwise padding a
+   * backdoored file past the limit would hide it from the scan entirely.
+   */
   maxFileBytes: 2 * 1024 * 1024,
 
   /** Max reported hits per rule per file; the rest are counted as suppressed. */
@@ -92,13 +108,17 @@ const CONFIG = {
   /**
    * Hosts that PerformHttpRequest / fetch may legitimately talk to.
    * Sub-domains are allowed (api.cfx.re matches cfx.re).
-   * Anything else is reported as HIGH.
+   * Anything else is reported as HIGH (SL012).
+   *
+   * Deliberately NOT included: raw code and paste hosts such as github.com,
+   * raw.githubusercontent.com, gist.github.com, pastebin.com, transfer.sh and
+   * file CDNs. They are the most common way a staged payload is fetched, so
+   * allowlisting them would exempt exactly the traffic worth reviewing.
+   * Add only hosts you control, and keep the list short.
    */
   ALLOWED_DOMAINS: [
     'cfx.re',
     'fivem.net',
-    'github.com',
-    'githubusercontent.com',
     'localhost',
     '127.0.0.1',
   ],
@@ -181,6 +201,14 @@ const RULES = [
   },
 ];
 
+/**
+ * A line that begins with a comment marker cannot execute, so its text is
+ * skipped to keep framework noise (commented-out load() calls, API docs)
+ * out of the report. Inline comments and long-comment bodies are still
+ * scanned: hiding real code costs more than a little noise.
+ */
+const COMMENT_PREFIX = { '.lua': '--', '.js': '//', '.html': '<!--' };
+
 /** Lines that look like outbound HTTP calls; the URL itself is inspected below. */
 const HTTP_CALL = /PerformHttpRequest(?:Internal)?\s*\(|\bfetch\s*\(|\bhttp\.request\b/i;
 const URL_LITERAL = /https?:\/\/([^/?#\s'"`)\]}>]+)/gi;
@@ -190,29 +218,85 @@ const IPV4 = /\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|
  * CLI / colour helpers
  * ========================================================================== */
 
-const rawArgs = process.argv.slice(2);
-const flags = new Set(rawArgs.filter((arg) => arg.startsWith('-')));
-const positional = rawArgs.filter((arg) => !arg.startsWith('-'));
+const DEFAULT_TRUST_FILE = './sourcelock-trust.json';
 
-if (flags.has('--help') || flags.has('-h')) {
+function parseArgs(argv) {
+  const options = {
+    target: null,
+    json: false,
+    strict: false,
+    all: false,
+    color: true,
+    help: false,
+    useTrust: true,
+    webhook: process.env.SOURCELOCK_WEBHOOK_URL || null,
+    trustFile: process.env.SOURCELOCK_TRUST_FILE || DEFAULT_TRUST_FILE,
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+
+    if (!arg.startsWith('-')) {
+      if (options.target) throw new Error('only one directory argument is supported');
+      options.target = arg;
+      continue;
+    }
+
+    if (arg === '--json') options.json = true;
+    else if (arg === '--strict') options.strict = true;
+    else if (arg === '--all') options.all = true;
+    else if (arg === '--no-color') options.color = false;
+    else if (arg === '--no-trust') options.useTrust = false;
+    else if (arg === '--help' || arg === '-h') options.help = true;
+    else if (arg === '--webhook' || arg === '--trust-file') {
+      const value = argv[index + 1];
+      if (!value || value.startsWith('-')) throw new Error(`${arg} requires a value`);
+      if (arg === '--webhook') options.webhook = value;
+      else options.trustFile = value;
+      index += 1;
+    } else {
+      throw new Error(`unknown option ${arg}`);
+    }
+  }
+
+  return options;
+}
+
+const OPTIONS = (() => {
+  try {
+    return parseArgs(process.argv.slice(2));
+  } catch (error) {
+    console.error(`SourceLock: ${error.message}`);
+    console.error('Run: node scanner.js --help');
+    process.exit(2);
+  }
+})();
+
+if (OPTIONS.help) {
   console.log(
     [
       'SourceLock scanner',
       '',
-      'Usage: node scanner.js [directory] [--json] [--strict] [--no-color]',
+      'Usage: node scanner.js [directory] [options]',
       '',
-      '  directory   Folder to scan (default: ./resources)',
-      '  --json      Print JSON instead of the terminal report',
-      '  --strict    Also fail on medium-severity findings',
-      '  --no-color  Disable ANSI colours',
+      '  directory        Folder to scan (default: ./resources)',
+      '  --json           Print JSON instead of the terminal report',
+      '  --strict         Also fail on medium-severity findings',
+      '  --all            Show every hit instead of capping at 3 per rule per file',
+      '  --no-color       Disable ANSI colours',
+      '  --webhook <url>  Post the report to a Discord webhook',
+      '  --trust-file <f> Trust list to read (default: ./sourcelock-trust.json)',
+      '  --no-trust       Ignore the trust list entirely',
+      '',
+      'Environment: SOURCELOCK_WEBHOOK_URL, SOURCELOCK_TRUST_FILE',
     ].join('\n')
   );
   process.exit(0);
 }
 
 const useColor =
-  !flags.has('--no-color') &&
-  !flags.has('--json') &&
+  OPTIONS.color &&
+  !OPTIONS.json &&
   !process.env.NO_COLOR &&
   (Boolean(process.env.FORCE_COLOR) || process.stdout.isTTY === true);
 
@@ -276,7 +360,7 @@ async function collectFiles(root) {
       entries = await fsp.readdir(dir.absolute, { withFileTypes: true });
     } catch (error) {
       stats.unreadable += 1;
-      if (!flags.has('--json')) {
+      if (!OPTIONS.json) {
         console.warn(color.medium(`  ! cannot read ${dir.relative || '.'}: ${error.code || error.message}`));
       }
       continue;
@@ -414,35 +498,85 @@ function inspectIpAddresses(line) {
  * Scanner
  * ========================================================================== */
 
+function describeBytes(buffer) {
+  const hex = buffer.subarray(0, 16).toString('hex');
+  if (!hex) return '(empty file)';
+  return `first bytes: ${hex.match(/.{1,2}/g).join(' ')}`;
+}
+
 async function scanFile(file, stats) {
   let buffer;
   try {
     buffer = await fsp.readFile(file.absolute);
   } catch (error) {
     stats.unreadable += 1;
-    return [];
+    // Never drop a file quietly: an unreadable file is exactly the kind of
+    // thing worth a human look, and a silent skip is a scan bypass.
+    return [
+      {
+        file: file.relative,
+        line: 0,
+        column: 0,
+        ruleId: 'SL017',
+        severity: 'medium',
+        title: 'file could not be read — check permissions and inspect it by hand',
+        snippet: '',
+        suppressed: false,
+      },
+    ];
+  }
+
+  const findings = [];
+  const perRule = new Map();
+  const ruleCap = OPTIONS.all ? Number.POSITIVE_INFINITY : CONFIG.findingsPerRule;
+
+  const looksLikeBytecode =
+    file.extension === '.luac' || buffer.subarray(0, 4).toString('latin1') === '\u001bLua';
+  const isBinary = isProbablyBinary(buffer);
+
+  // Bytecode and NUL-padded files used to be skipped as "binary", which is a
+  // one-byte scan bypass. Report them, then still scan their bytes as latin1.
+  if (looksLikeBytecode || isBinary) {
+    findings.push({
+      file: file.relative,
+      line: 1,
+      column: 1,
+      ruleId: looksLikeBytecode ? 'SL014' : 'SL015',
+      severity: looksLikeBytecode ? 'high' : 'medium',
+      title: looksLikeBytecode
+        ? 'compiled Lua bytecode — cannot be reviewed, treat as untrusted'
+        : 'binary/NUL content in a source file — obfuscation or corruption',
+      snippet: describeBytes(buffer),
+      suppressed: false,
+    });
   }
 
   if (buffer.length > CONFIG.maxFileBytes) {
     stats.skippedLarge += 1;
-    return [];
+    findings.push({
+      file: file.relative,
+      line: 0,
+      column: 0,
+      ruleId: 'SL016',
+      severity: 'medium',
+      title: `file is ${buffer.length} bytes, over the ${CONFIG.maxFileBytes} byte scan limit — not pattern-scanned`,
+      snippet: '',
+      suppressed: false,
+    });
+    return findings;
   }
 
-  if (isProbablyBinary(buffer)) {
-    stats.skippedBinary += 1;
-    return [];
-  }
-
+  if (isBinary) stats.skippedBinary += 1;
   stats.scanned += 1;
 
-  const findings = [];
-  const perRule = new Map();
-  const lines = buffer.toString('utf8').split(/\r\n|\n|\r/);
+  const lines = (isBinary ? buffer.toString('latin1') : buffer.toString('utf8')).split(
+    /\r\n|\n|\r/
+  );
 
   const record = (lineNumber, line, hit, column) => {
     const seen = perRule.get(hit.ruleId) || 0;
     perRule.set(hit.ruleId, seen + 1);
-    if (seen >= CONFIG.findingsPerRule) return;
+    if (seen >= ruleCap) return;
 
     findings.push({
       file: file.relative,
@@ -456,9 +590,12 @@ async function scanFile(file, stats) {
     });
   };
 
+  const commentPrefix = COMMENT_PREFIX[file.extension];
+
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     if (line.trim().length === 0) continue;
+    if (commentPrefix && line.trimStart().startsWith(commentPrefix)) continue;
 
     for (const rule of RULES) {
       if (rule.langs && !rule.langs.includes(file.extension)) continue;
@@ -492,8 +629,8 @@ async function scanFile(file, stats) {
 
   // Mark findings that were dropped by the per-rule cap so the report is honest.
   for (const [ruleId, total] of perRule) {
-    if (total <= CONFIG.findingsPerRule) continue;
-    const extra = total - CONFIG.findingsPerRule;
+    if (total <= ruleCap) continue;
+    const extra = total - ruleCap;
     findings.push({
       file: file.relative,
       line: 0,
@@ -509,8 +646,18 @@ async function scanFile(file, stats) {
   return findings;
 }
 
+function loadTrustSafely(filePath) {
+  try {
+    return loadTrust(filePath);
+  } catch (error) {
+    // Fail closed: an unreadable trust list trusts nothing, it never hides findings.
+    console.warn(color.medium(`  ! trust list ignored: ${error.message}`));
+    return { version: 1, entries: [] };
+  }
+}
+
 async function main() {
-  const target = path.resolve(positional[0] || CONFIG.targetDir);
+  const target = path.resolve(OPTIONS.target || CONFIG.targetDir);
 
   try {
     const stat = await fsp.stat(target);
@@ -529,42 +676,51 @@ async function main() {
     for (const finding of fileFindings) findings.push(finding);
   }
 
+  // Attach a stable fingerprint (file + rule + snippet) so one finding can be
+  // trusted on its own, and stays trusted only while that code is unchanged.
+  const trust = OPTIONS.useTrust ? loadTrustSafely(OPTIONS.trustFile) : { version: 1, entries: [] };
+  for (const finding of findings) {
+    finding.fingerprint = fingerprintFinding(finding);
+    finding.trusted = !finding.suppressed && isTrusted(trust, finding);
+  }
+
+  // Group by file so each path is printed once, with its high-risk hits first.
   findings.sort(
     (a, b) =>
-      (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9) ||
       a.file.localeCompare(b.file) ||
+      (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9) ||
       a.line - b.line
   );
 
-  const real = findings.filter((finding) => !finding.suppressed);
+  const actionable = findings.filter((finding) => !finding.suppressed && !finding.trusted);
   const summary = {
-    high: real.filter((finding) => finding.severity === 'high').length,
-    medium: real.filter((finding) => finding.severity === 'medium').length,
-    filesAffected: new Set(real.map((finding) => finding.file)).size,
+    high: actionable.filter((finding) => finding.severity === 'high').length,
+    medium: actionable.filter((finding) => finding.severity === 'medium').length,
+    trusted: findings.filter((finding) => finding.trusted).length,
+    filesAffected: new Set(actionable.map((finding) => finding.file)).size,
   };
 
   const durationMs = Date.now() - started;
+  const scannedAt = new Date().toISOString();
+  const result = { target, scannedAt, durationMs, stats, summary, findings };
 
-  if (flags.has('--json')) {
-    console.log(
-      JSON.stringify(
-        {
-          target,
-          scannedAt: new Date().toISOString(),
-          durationMs,
-          stats,
-          summary,
-          findings,
-        },
-        null,
-        2
-      )
-    );
+  if (OPTIONS.json) {
+    console.log(JSON.stringify(result, null, 2));
   } else {
-    printReport({ target, files, stats, findings, summary, durationMs });
+    printReport({ ...result, files });
   }
 
-  const failed = summary.high > 0 || (flags.has('--strict') && summary.medium > 0);
+  if (OPTIONS.webhook) {
+    try {
+      await postScanReport(OPTIONS.webhook, result);
+      if (!OPTIONS.json) console.log(color.dim('  report posted to Discord'));
+    } catch (error) {
+      // Reporting must never change the scan result or its exit code.
+      console.error(color.medium(`  ! Discord report not sent: ${error.message}`));
+    }
+  }
+
+  const failed = summary.high > 0 || (OPTIONS.strict && summary.medium > 0);
   process.exit(failed ? 1 : 0);
 }
 
@@ -577,11 +733,16 @@ function printReport({ target, files, stats, findings, summary, durationMs }) {
       `  files  : ${stats.scanned}/${files.length} scanned` +
         (stats.whitelisted ? `, ${stats.whitelisted} whitelisted` : '') +
         (stats.prunedDirs ? `, ${stats.prunedDirs} dirs pruned` : '') +
-        (stats.skippedLarge ? `, ${stats.skippedLarge} too large` : '') +
-        (stats.skippedBinary ? `, ${stats.skippedBinary} binary` : '') +
+        (stats.skippedLarge ? `, ${stats.skippedLarge} over the size limit` : '') +
+        (stats.skippedBinary ? `, ${stats.skippedBinary} with binary content (scanned anyway)` : '') +
         (stats.unreadable ? `, ${stats.unreadable} unreadable` : '')
     )
   );
+
+  if (stats.prunedDirs > 0 || stats.whitelisted > 0) {
+    console.log(color.dim('  note   : whitelisted/pruned paths were NOT scanned — keep WHITELIST short'));
+  }
+
   console.log('');
 
   if (findings.length === 0) {
@@ -603,23 +764,42 @@ function printReport({ target, files, stats, findings, summary, durationMs }) {
       continue;
     }
 
+    if (finding.trusted) {
+      console.log(`    ${color.dim('TRUST ')} ${color.dim(finding.ruleId)}  ${color.dim(finding.title)}`);
+      if (finding.snippet) {
+        console.log(`           ${color.dim(`${finding.file}:${finding.line}`)}  ${color.dim(finding.snippet)}`);
+      }
+      continue;
+    }
+
     const tag =
       finding.severity === 'high'
         ? color.high('HIGH  ')
         : color.medium('MEDIUM');
-    const location = color.dim(`${finding.file}:${finding.line}:${finding.column}`);
+    const location =
+      finding.line > 0
+        ? color.dim(`${finding.file}:${finding.line}:${finding.column}`)
+        : color.dim(finding.file);
     console.log(`    ${tag} ${color.bold(finding.ruleId)}  ${finding.title}`);
-    console.log(`           ${location}  ${color.dim(finding.snippet)}`);
+    console.log(`           ${location}${finding.snippet ? `  ${color.dim(finding.snippet)}` : ''}`);
   }
 
   console.log('');
   const parts = [];
   if (summary.high) parts.push(color.high(`${summary.high} high`));
   if (summary.medium) parts.push(color.medium(`${summary.medium} medium`));
+  if (summary.trusted) parts.push(color.dim(`${summary.trusted} trusted`));
   if (parts.length === 0) parts.push(color.ok('0 actionable'));
-  console.log(
-    `  ${color.bold('Summary:')} ${parts.join(', ')} across ${summary.filesAffected} file(s) — ${durationMs} ms`
-  );
+  const suppressedCount = findings.filter((finding) => finding.suppressed).length;
+  const scope = summary.filesAffected > 0 ? ` across ${summary.filesAffected} file(s)` : '';
+  console.log(`  ${color.bold('Summary:')} ${parts.join(', ')}${scope} — ${durationMs} ms`);
+  if (suppressedCount > 0) {
+    console.log(
+      color.medium(
+        `  ${suppressedCount} further hit(s) hidden by the ${CONFIG.findingsPerRule}-per-rule cap — rerun with --all to see every one.`
+      )
+    );
+  }
 
   if (summary.high > 0) {
     console.log(color.high('  Blocked: high-risk findings present. Do not boot with these unresolved.'));

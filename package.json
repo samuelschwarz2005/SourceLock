@@ -1,0 +1,17 @@
+{
+  "name": "sourcelock",
+  "version": "1.0.1",
+  "private": true,
+  "description": "FiveM anti-backdoor scanner and server-to-client script loader, with Discord reporting and trust.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "scan": "node scanner.js",
+    "bot": "node bot/index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3"
+  }
+}

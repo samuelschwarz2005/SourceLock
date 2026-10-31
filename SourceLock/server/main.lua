@@ -18,9 +18,11 @@ local payload      -- raw text of SourceLock.payloadFile
 local payloadHash  -- SourceLock.hash(payload)
 
 local challenges   = {}   -- [src] = { token = string, expires = number }
-local budget       = {}   -- [src] = { count = number, resetAt = number }
+local budget       = {}   -- [src] = { count = number, resetAt = number } (tickets)
+local responses    = {}   -- [src] = { count = number, resetAt = number } (responses, valid or not)
 local lastTicket   = {}   -- [src] = GetGameTimer() of the last issued ticket
 local lastDelivery = {}   -- [src] = GetGameTimer() of the last payload delivery
+local inFlight     = {}   -- [src] = GetGameTimer() of an un-acknowledged delivery
 
 local function now()
     return GetGameTimer()
@@ -53,6 +55,16 @@ local function readPayload()
         return false
     end
 
+    if #code > SourceLock.maxPayloadBytes then
+        payload, payloadHash = nil, nil
+        SourceLock.log(
+            '^1payload is %d bytes, over the %d byte limit — refusing to cache it',
+            #code,
+            SourceLock.maxPayloadBytes
+        )
+        return false
+    end
+
     payload, payloadHash = code, SourceLock.hash(code)
     SourceLock.log('payload cached: %s (%d bytes, hash %s)', SourceLock.payloadFile, #code, payloadHash)
     return true
@@ -78,6 +90,21 @@ local function consumeBudget(src)
 
     entry.count = entry.count + 1
     return true
+end
+
+--- Responses get their own budget: a client that only ever sends garbage is
+--- still cheap to handle, but it should not be free to keep the handler busy.
+local function responseAllowed(src)
+    local current = now()
+    local entry = responses[src]
+
+    if not entry or current >= entry.resetAt then
+        responses[src] = { count = 1, resetAt = current + 60000 }
+        return true
+    end
+
+    entry.count = entry.count + 1
+    return entry.count <= SourceLock.maxResponses
 end
 
 local function issueChallenge(src)
@@ -138,6 +165,11 @@ RegisterNetEvent('sourcelock:challengeResponse', function(token)
     local src = source
     if not isConnected(src) then return end
 
+    if not responseAllowed(src) then
+        SourceLock.debugLog('response flood from %d — ignored', src)
+        return
+    end
+
     local ticket = challenges[src]
     challenges[src] = nil -- single use, whether it matches or not
 
@@ -166,13 +198,32 @@ RegisterNetEvent('sourcelock:challengeResponse', function(token)
     end
 
     local current = now()
+
+    -- A second delivery while the first is still arriving would interleave
+    -- chunks and corrupt the client's assembly buffer, so wait for the ack
+    -- (or the safety timeout) before starting another one.
+    if inFlight[src] and (current - inFlight[src]) < SourceLock.deliveryTimeout then
+        SourceLock.debugLog('delivery to %d ignored: previous delivery still in flight', src)
+        return
+    end
+
     if lastDelivery[src] and (current - lastDelivery[src]) < SourceLock.deliveryCooldown then
         SourceLock.debugLog('delivery to %d ignored: cooldown', src)
         return
     end
 
     lastDelivery[src] = current
+    inFlight[src] = current
     deliver(src)
+end)
+
+-- The client confirms it finished assembling the payload (accepted or
+-- rejected), which releases the in-flight lock above.
+RegisterNetEvent('sourcelock:ack', function()
+    local src = source
+    if not isConnected(src) then return end
+
+    inFlight[src] = nil
 end)
 
 --=====================================================================
@@ -183,8 +234,10 @@ AddEventHandler('playerDropped', function()
     local src = source
     challenges[src] = nil
     budget[src] = nil
+    responses[src] = nil
     lastTicket[src] = nil
     lastDelivery[src] = nil
+    inFlight[src] = nil
 end)
 
 AddEventHandler('onResourceStart', function(resource)
