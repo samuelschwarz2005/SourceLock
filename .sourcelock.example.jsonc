@@ -1,0 +1,50 @@
+// SourceLock — optional settings. Copy to .sourcelock.jsonc and edit.
+//
+// Every key below is optional: anything you leave out keeps the built-in
+// default in scanner.js. Unknown keys stop the scan with exit code 2, so a
+// typo can never quietly disable a check. Comments and trailing commas are
+// allowed.
+{
+  // Folder scanned when no directory argument is passed.
+  "targetDir": "./resources",
+
+  // Replace the built-in skip list entirely? Leave false to extend it.
+  "useDefaultWhitelist": false,
+
+  // Extra paths that are never scanned. Same substring + "*" matching as the
+  // built-in list; a trailing "/" marks a directory.
+  "whitelist": [
+    "resources/[cfx]/",
+    "resources/[system]/",
+    "resources/oxmysql/lib/",
+    "resources/vendor/"
+  ],
+
+  // Paths matched by .sourcelockignore are never scanned either. Patterns
+  // there use gitignore syntax: "*", "**", "?", "!", trailing "/" for
+  // directories, and a leading "/" to anchor at the scan root.
+  "ignorePatterns": [
+    "**/*.min.js",
+    "!keep.min.js"
+  ],
+
+  // Optional explicit ignore file (default: .sourcelockignore beside this file).
+  // "ignoreFile": "./.sourcelockignore",
+
+  // Rule behaviour: "off" removes a rule, "high"/"medium" re-grades it.
+  "rules": {
+    "SL003": "off",
+    "SL013": "medium"
+  },
+
+  // Extra hosts that HTTP calls may talk to. Bare hostnames only — sub-domains
+  // are included automatically. Never add paste/code hosts here.
+  "allowedDomains": ["api.myserver.com"],
+
+  // Scan tuning. Bounds are enforced; out-of-range values stop the scan.
+  "maxFileBytes": 2097152,
+  "findingsPerRule": 3,
+  "snippetWidth": 160,
+  "followSymlinks": false,
+  "ignorePrivateIps": true
+}

@@ -36,6 +36,8 @@ node scanner.js ./resources --json   # machine-readable output for CI
 node scanner.js ./resources --all    # every hit, no per-rule cap
 node scanner.js ./resources --webhook "$URL"   # post the report to Discord
 node scanner.js ./resources --no-trust        # ignore the trust list
+node scanner.js ./resources --config custom.jsonc   # explicit settings file
+node scanner.js ./resources --no-config       # ignore config and ignore file
 node scanner.js --help
 ```
 
@@ -47,7 +49,7 @@ No npm install required: the scanner uses Node built-ins plus its own `lib/` hel
 | --- | --- |
 | `0` | No findings matching the current policy |
 | `1` | High-risk findings present (or medium with `--strict`) |
-| `2` | Scanner error — target missing or unreadable |
+| `2` | Scanner error — target missing or unreadable, or a config file that will not validate |
 
 That makes it usable as a boot gate:
 
@@ -79,13 +81,31 @@ node scanner.js ./resources || { echo "Refusing to boot: backdoor signatures fou
 
 Each hit prints the file, `line:column`, the rule and the offending snippet. High-risk lines are red, medium yellow, and hits beyond the per-rule cap per file are summarised instead of flooding the terminal.
 
-### Editing the whitelist
+### Configuration
 
-Everything you normally touch lives in the `CONFIG` block at the top of `scanner.js`:
+Defaults live in the `DEFAULTS` block at the top of `scanner.js`, and anything you want to change for your server belongs in `.sourcelock.jsonc` next to where you run the scanner. Copy [`.sourcelock.example.jsonc`](.sourcelock.example.jsonc) to get started — comments and trailing commas are allowed.
 
-- **`WHITELIST`** — files and directories to skip. Entries are case-insensitive substrings of the path relative to the target root, `*` is a wildcard, and a trailing `/` prunes a whole directory. It ships covering build tooling (`yarn/`, `webpack/`, `node_modules/`, `dist/`) and official Cfx.re resources (`[cfx]/`, `sessionmanager/`, `mapmanager/`, …). Every entry is a blind spot, so keep it short.
-- **`ALLOWED_DOMAINS`** — hosts that `PerformHttpRequest`/`fetch` may legally reach. Sub-domains match (`api.cfx.re` matches `cfx.re`). Anything else is reported high. Raw code and paste hosts (`github.com`, `raw.githubusercontent.com`, `pastebin.com`, `transfer.sh`, file CDNs) are deliberately **not** allowlisted: that is where staged payloads are fetched from. **Add only hosts you control.**
-- **`maxFileBytes`**, **`findingsPerRule`**, **`snippetWidth`**, **`ignorePrivateIps`** — tuning knobs.
+```jsonc
+{
+  "useDefaultWhitelist": false,
+  "whitelist": ["resources/[cfx]/", "resources/[system]/", "resources/oxmysql/lib/"],
+  "ignorePatterns": ["**/*.min.js"],
+  "rules": { "SL003": "off", "SL013": "medium" },
+  "allowedDomains": ["api.myserver.com"]
+}
+```
+
+- **`whitelist`** — extra files and directories to skip. Entries are case-insensitive substrings of the path relative to the target root, `*` is a wildcard, and a trailing `/` prunes a whole directory. Set `useDefaultWhitelist: false` to replace the shipped list instead of extending it. Every entry is a blind spot, so keep it short.
+- **`.sourcelockignore`** — gitignore-style patterns for paths that must never be scanned: `*`, `**`, `?`, a leading `/` to anchor at the scan root, a trailing `/` for directories, and `!` to re-include. This is the one place to exclude a folder without editing source.
+- **`rules`** — `"off"` removes a rule; `"high"`/`"medium"` re-grades it. This applies to every rule, including the ones that emit their own severity (`SL011`–`SL017`).
+- **`allowedDomains`** — extra hosts that `PerformHttpRequest`/`fetch` may legally reach. Sub-domains match (`api.cfx.re` matches `cfx.re`). Anything else is reported high. Raw code and paste hosts (`github.com`, `raw.githubusercontent.com`, `pastebin.com`, `transfer.sh`, file CDNs) are deliberately **not** allowlisted: that is where staged payloads are fetched from. **Add only hosts you control.**
+- **`maxFileBytes`**, **`findingsPerRule`**, **`snippetWidth`**, **`ignorePrivateIps`**, **`followSymlinks`** — tuning knobs, all range-checked.
+
+Validation is deliberately strict in one direction only. An unknown key, a bad type or an out-of-range number stops the scan with exit code `2` rather than falling back to defaults, because a typo must never quietly weaken a check. Ignore patterns are the exception: an unusable one (`..`, an absolute path, control characters) is skipped with a warning and the scan continues, since aborting a whole audit over one bad line is the worse outcome. Both files are size-capped, patterns are compiled to linear regular expressions, and `--no-config` ignores both files for a reproducible CI run.
+
+### Editing the built-in defaults
+
+`WHITELIST` and `ALLOWED_DOMAINS` still exist in `scanner.js` for the zero-config case, and the defaults are what every config file is merged over.
 
 ### Limitations of static scanning
 

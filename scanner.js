@@ -10,6 +10,7 @@
  * Usage:
  *   node scanner.js [directory] [--json] [--strict] [--all] [--no-color]
  *                   [--webhook <url>] [--trust-file <path>] [--no-trust]
+ *                   [--config <file>] [--ignore <file>] [--no-config]
  *
  *   directory        Folder to scan. Default: ./resources
  *   --json           Machine-readable output (for CI). Implies --no-color.
@@ -19,6 +20,9 @@
  *   --webhook <url>  Post the report to a Discord webhook (or SOURCELOCK_WEBHOOK_URL).
  *   --trust-file <f> Trust list to read (or SOURCELOCK_TRUST_FILE).
  *   --no-trust       Ignore the trust list entirely.
+ *   --config <file>  Settings file (default: ./.sourcelock.jsonc when present).
+ *   --ignore <file>  Ignore file (default: .sourcelockignore beside the config).
+ *   --no-config      Ignore the config file and its ignore file.
  *
  * Exit codes: 0 = clean, 1 = findings that match the selected policy,
  *             2 = scanner error (bad target, unreadable root, ...).
@@ -33,12 +37,13 @@ const path = require('node:path');
 
 const { fingerprintFinding, isTrusted, loadTrust } = require('./lib/trust');
 const { postScanReport } = require('./lib/discord-report');
+const { resolveConfig } = require('./lib/config');
 
 /* ==========================================================================
- * CONFIG — edit this block
+ * DEFAULTS — overridable in .sourcelock.jsonc (see lib/config.js)
  * ========================================================================== */
 
-const CONFIG = {
+const DEFAULTS = {
   /** Folder scanned when no directory argument is passed. */
   targetDir: './resources',
 
@@ -202,6 +207,22 @@ const RULES = [
 ];
 
 /**
+ * Every rule ID the scanner can emit. SL011-SL017 are produced by the content
+ * inspectors rather than the RULES table, but the config must still be able
+ * to turn them off or re-grade them.
+ */
+const RULE_IDS = [
+  ...RULES.map((rule) => rule.id),
+  'SL011',
+  'SL012',
+  'SL013',
+  'SL014',
+  'SL015',
+  'SL016',
+  'SL017',
+];
+
+/**
  * A line that begins with a comment marker cannot execute, so its text is
  * skipped to keep framework noise (commented-out load() calls, API docs)
  * out of the report. Inline comments and long-comment bodies are still
@@ -229,6 +250,9 @@ function parseArgs(argv) {
     color: true,
     help: false,
     useTrust: true,
+    useConfig: true,
+    config: null,
+    ignore: null,
     webhook: process.env.SOURCELOCK_WEBHOOK_URL || null,
     trustFile: process.env.SOURCELOCK_TRUST_FILE || DEFAULT_TRUST_FILE,
   };
@@ -247,12 +271,15 @@ function parseArgs(argv) {
     else if (arg === '--all') options.all = true;
     else if (arg === '--no-color') options.color = false;
     else if (arg === '--no-trust') options.useTrust = false;
+    else if (arg === '--no-config') options.useConfig = false;
     else if (arg === '--help' || arg === '-h') options.help = true;
-    else if (arg === '--webhook' || arg === '--trust-file') {
+    else if (arg === '--webhook' || arg === '--trust-file' || arg === '--config' || arg === '--ignore') {
       const value = argv[index + 1];
       if (!value || value.startsWith('-')) throw new Error(`${arg} requires a value`);
       if (arg === '--webhook') options.webhook = value;
-      else options.trustFile = value;
+      else if (arg === '--trust-file') options.trustFile = value;
+      else if (arg === '--config') options.config = value;
+      else options.ignore = value;
       index += 1;
     } else {
       throw new Error(`unknown option ${arg}`);
@@ -287,12 +314,49 @@ if (OPTIONS.help) {
       '  --webhook <url>  Post the report to a Discord webhook',
       '  --trust-file <f> Trust list to read (default: ./sourcelock-trust.json)',
       '  --no-trust       Ignore the trust list entirely',
+      '  --config <file>  Settings file (default: ./.sourcelock.jsonc)',
+      '  --ignore <file>  Ignore file (default: .sourcelockignore)',
+      '  --no-config      Ignore the config file and its ignore file',
       '',
       'Environment: SOURCELOCK_WEBHOOK_URL, SOURCELOCK_TRUST_FILE',
     ].join('\n')
   );
   process.exit(0);
 }
+
+/* ==========================================================================
+ * Configuration (defaults + .sourcelock.jsonc + .sourcelockignore)
+ * ========================================================================== */
+
+const RESOLVED = (() => {
+  try {
+    return resolveConfig({
+      cwd: process.cwd(),
+      configPath: OPTIONS.config,
+      ignorePath: OPTIONS.ignore,
+      useConfig: OPTIONS.useConfig,
+      defaults: DEFAULTS,
+      ruleIds: RULE_IDS,
+    });
+  } catch (error) {
+    console.error(`SourceLock: ${error.message}`);
+    process.exit(2);
+  }
+})();
+
+const CONFIG = RESOLVED.config;
+
+for (const warning of RESOLVED.warnings) {
+  console.warn(`  ! ${warning}`);
+}
+
+/** Rules that survived "off" and picked up any severity override. */
+const ACTIVE_RULES = RULES.map((rule) => ({
+  ...rule,
+  severity: RESOLVED.rules.severity.get(rule.id) || rule.severity,
+})).filter((rule) => !RESOLVED.rules.disabled.has(rule.id));
+
+const severityOf = (ruleId, fallback) => RESOLVED.rules.severity.get(ruleId) || fallback;
 
 const useColor =
   OPTIONS.color &&
@@ -335,6 +399,11 @@ function isWhitelisted(relativePath, isDirectory) {
   return whitelistMatchers.some((matcher) => matcher.test(candidate));
 }
 
+/** Paths matched by .sourcelockignore are never scanned. */
+function isIgnored(relativePath, isDirectory) {
+  return RESOLVED.ignore.match(relativePath, isDirectory);
+}
+
 /* ==========================================================================
  * File discovery
  * ========================================================================== */
@@ -344,6 +413,8 @@ async function collectFiles(root) {
     scanned: 0,
     whitelisted: 0,
     prunedDirs: 0,
+    ignored: 0,
+    ignoredDirs: 0,
     skippedLarge: 0,
     skippedBinary: 0,
     unreadable: 0,
@@ -377,6 +448,11 @@ async function collectFiles(root) {
           stats.prunedDirs += 1;
           continue;
         }
+        // Pruning on an ignore match is only safe without negation patterns.
+        if (RESOLVED.ignore.canPrune && isIgnored(relative, true)) {
+          stats.ignoredDirs += 1;
+          continue;
+        }
         stack.push({ absolute, relative });
         continue;
       }
@@ -386,6 +462,11 @@ async function collectFiles(root) {
 
       if (isWhitelisted(relative, false)) {
         stats.whitelisted += 1;
+        continue;
+      }
+
+      if (isIgnored(relative, false)) {
+        stats.ignored += 1;
         continue;
       }
 
@@ -597,7 +678,7 @@ async function scanFile(file, stats) {
     if (line.trim().length === 0) continue;
     if (commentPrefix && line.trimStart().startsWith(commentPrefix)) continue;
 
-    for (const rule of RULES) {
+    for (const rule of ACTIVE_RULES) {
       if (rule.langs && !rule.langs.includes(file.extension)) continue;
       const match = rule.re.exec(line);
       if (!match) continue;
@@ -673,7 +754,13 @@ async function main() {
 
   for (const file of files) {
     const fileFindings = await scanFile(file, stats);
-    for (const finding of fileFindings) findings.push(finding);
+    for (const finding of fileFindings) {
+      // "off" in the config removes the rule entirely; severity overrides
+      // apply to every finding, including the ones rules emit directly.
+      if (RESOLVED.rules.disabled.has(finding.ruleId)) continue;
+      if (!finding.suppressed) finding.severity = severityOf(finding.ruleId, finding.severity);
+      findings.push(finding);
+    }
   }
 
   // Attach a stable fingerprint (file + rule + snippet) so one finding can be
@@ -702,7 +789,19 @@ async function main() {
 
   const durationMs = Date.now() - started;
   const scannedAt = new Date().toISOString();
-  const result = { target, scannedAt, durationMs, stats, summary, findings };
+  const result = {
+    target,
+    scannedAt,
+    durationMs,
+    stats,
+    summary,
+    findings,
+    config: RESOLVED.configPath,
+    rules: {
+      disabled: [...RESOLVED.rules.disabled],
+      severity: Object.fromEntries(RESOLVED.rules.severity),
+    },
+  };
 
   if (OPTIONS.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -724,14 +823,17 @@ async function main() {
   process.exit(failed ? 1 : 0);
 }
 
-function printReport({ target, files, stats, findings, summary, durationMs }) {
+function printReport({ target, files, stats, findings, summary, durationMs, config }) {
   console.log('');
   console.log(color.bold('SourceLock — anti-backdoor scan'));
   console.log(color.dim(`  target : ${target}`));
+  if (config) console.log(color.dim(`  config : ${config}`));
   console.log(
     color.dim(
       `  files  : ${stats.scanned}/${files.length} scanned` +
         (stats.whitelisted ? `, ${stats.whitelisted} whitelisted` : '') +
+        (stats.ignored ? `, ${stats.ignored} ignored` : '') +
+        (stats.ignoredDirs ? `, ${stats.ignoredDirs} ignored dirs` : '') +
         (stats.prunedDirs ? `, ${stats.prunedDirs} dirs pruned` : '') +
         (stats.skippedLarge ? `, ${stats.skippedLarge} over the size limit` : '') +
         (stats.skippedBinary ? `, ${stats.skippedBinary} with binary content (scanned anyway)` : '') +
