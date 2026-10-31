@@ -44,7 +44,13 @@ function runScan(cwd, args = []) {
   const argv = [path.join(ROOT, 'scanner.js'), '.', '--json', '--no-color', '--no-trust', ...args];
 
   try {
-    const stdout = execFileSync(process.execPath, argv, { cwd, encoding: 'utf8', timeout: 20000 });
+    const stdout = execFileSync(process.execPath, argv, {
+      cwd,
+      encoding: 'utf8',
+      timeout: 20000,
+      // Never let a test scan post to a real webhook just because the shell has one.
+      env: { ...process.env, SOURCELOCK_WEBHOOK_URL: '' },
+    });
     return { code: 0, result: JSON.parse(stdout) };
   } catch (error) {
     const stdout = String(error.stdout || '');

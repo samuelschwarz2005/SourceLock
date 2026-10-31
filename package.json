@@ -9,7 +9,8 @@
   },
   "scripts": {
     "scan": "node scanner.js",
-    "bot": "node bot/index.js"
+    "bot": "node bot/index.js",
+    "test": "node --test test/"
   },
   "dependencies": {
     "discord.js": "^14.16.3"

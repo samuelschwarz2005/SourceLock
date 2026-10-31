@@ -422,6 +422,14 @@ async function collectFiles(root) {
 
   const files = [];
   const stack = [{ absolute: root, relative: '' }];
+  // Real paths already visited, so following symlinks cannot loop.
+  const visitedDirs = new Set();
+
+  try {
+    visitedDirs.add(await fsp.realpath(root));
+  } catch {
+    // Not fatal: the directory walk below reports unreadable roots.
+  }
 
   while (stack.length > 0) {
     const dir = stack.pop();
@@ -441,9 +449,39 @@ async function collectFiles(root) {
       const relative = dir.relative ? `${dir.relative}/${entry.name}` : entry.name;
       const absolute = path.join(dir.absolute, entry.name);
 
-      if (entry.isSymbolicLink() && !CONFIG.followSymlinks) continue;
+      let isDirectory = entry.isDirectory();
+      let isFile = entry.isFile();
 
-      if (entry.isDirectory()) {
+      if (entry.isSymbolicLink()) {
+        // A Dirent for a symlink reports isDirectory()/isFile() as false even
+        // when followSymlinks is on, so the target has to be checked instead.
+        if (!CONFIG.followSymlinks) continue;
+
+        let target;
+        try {
+          target = await fsp.stat(absolute);
+        } catch {
+          stats.unreadable += 1;
+          continue;
+        }
+
+        isDirectory = target.isDirectory();
+        isFile = target.isFile();
+
+        if (isDirectory) {
+          let real;
+          try {
+            real = await fsp.realpath(absolute);
+          } catch {
+            stats.unreadable += 1;
+            continue;
+          }
+          if (visitedDirs.has(real)) continue;
+          visitedDirs.add(real);
+        }
+      }
+
+      if (isDirectory) {
         if (isWhitelisted(relative, true)) {
           stats.prunedDirs += 1;
           continue;
@@ -457,7 +495,7 @@ async function collectFiles(root) {
         continue;
       }
 
-      if (!entry.isFile()) continue;
+      if (!isFile) continue;
       if (!CONFIG.extensions.includes(path.extname(entry.name).toLowerCase())) continue;
 
       if (isWhitelisted(relative, false)) {
